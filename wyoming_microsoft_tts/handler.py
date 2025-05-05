@@ -2,9 +2,7 @@
 
 import argparse
 import logging
-import math
-import os
-import wave
+from queue import Queue
 
 from wyoming.audio import AudioChunk, AudioStart, AudioStop
 from wyoming.event import Event
@@ -14,6 +12,9 @@ from wyoming.tts import Synthesize
 
 from .microsoft_tts import MicrosoftTTS
 
+logging.basicConfig(
+    level=logging.DEBUG, format="%(asctime)s %(threadName)s %(message)s"
+)
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -69,54 +70,47 @@ class MicrosoftEventHandler(AsyncEventHandler):
             if not has_punctuation:
                 text = text + self.cli_args.auto_punctuation[0]
 
-        _LOGGER.debug("Synthesizing: %s", text)
+        rate = self.cli_args.sample_rate
+        width = 2
+        channels = 1
+        _LOGGER.debug("Synthesizing (%dHz): %s", rate, text)
+
         try:
-            output_path = self.microsoft_tts.synthesize(text=text, voice=voice)
+            await self.write_event(
+                AudioStart(
+                    rate=rate,
+                    width=width,
+                    channels=channels,
+                ).event()
+            )
+
+            queue = Queue[bytes]()
+
+            self.microsoft_tts.synthesize(text=text, voice=voice, bytes_queue=queue)
+
+            while chunk := queue.get():
+                if len(chunk) == 0:
+                    _LOGGER.debug("Received empty chunk, stopping")
+                    break
+
+                await self.write_event(
+                    AudioChunk(
+                        audio=chunk,
+                        rate=rate,
+                        width=width,
+                        channels=channels,
+                    ).event()
+                )
+                queue.task_done()
+                _LOGGER.debug("Wrote chunk length %d", len(chunk))
+
         except Exception as e:
             _LOGGER.error("Failed to synthesize text: %s", e)
             return False
 
         _LOGGER.debug("Synthesized text")
-        try:
-            wav_file: wave.Wave_read = wave.open(output_path, "rb")
-            with wav_file:
-                rate = wav_file.getframerate()
-                width = wav_file.getsampwidth()
-                channels = wav_file.getnchannels()
-
-                await self.write_event(
-                    AudioStart(
-                        rate=rate,
-                        width=width,
-                        channels=channels,
-                    ).event(),
-                )
-
-                # Audio
-                audio_bytes = wav_file.readframes(wav_file.getnframes())
-                bytes_per_sample = width * channels
-                bytes_per_chunk = bytes_per_sample * self.cli_args.samples_per_chunk
-                num_chunks = int(math.ceil(len(audio_bytes) / bytes_per_chunk))
-
-                # Split into chunks
-                for i in range(num_chunks):
-                    offset = i * bytes_per_chunk
-                    chunk = audio_bytes[offset : offset + bytes_per_chunk]
-                    await self.write_event(
-                        AudioChunk(
-                            audio=chunk,
-                            rate=rate,
-                            width=width,
-                            channels=channels,
-                        ).event(),
-                    )
-        except Exception as e:
-            _LOGGER.error("Failed to send audio: %s", e)
-            return False
 
         await self.write_event(AudioStop().event())
         _LOGGER.debug("Completed request")
-
-        os.unlink(output_path)
 
         return True
