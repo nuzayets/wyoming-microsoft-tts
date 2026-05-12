@@ -68,6 +68,17 @@ def parse_arguments():
         help="Disable audio streaming on sentence boundaries",
     )
     parser.add_argument("--samples-per-chunk", type=int, default=1024)
+    parser.add_argument(
+        "--prefill-ms",
+        type=int,
+        default=200,
+        help=(
+            "Hold the first N ms of audio per stream before emitting AudioStart, "
+            "so the satellite has playback headroom to absorb mid-stream Azure "
+            "pacing jitter. Set 0 to disable (lowest TTFB; vulnerable to "
+            "satellite-side buffer underruns)."
+        ),
+    )
     #
     parser.add_argument(
         "--rate",

@@ -46,6 +46,16 @@ class MicrosoftEventHandler(AsyncEventHandler):
         # AudioStop once at the end. HA's wyoming tts.py honors only the
         # first AudioStart and ignores per-sentence framing.
         self._stream_audio_started: bool = False
+        # Per-stream prefill: hold the first cli_args.prefill_ms of audio
+        # before emitting AudioStart, so the satellite has buffer headroom
+        # to absorb mid-stream Azure pacing jitter. Drained on the first
+        # chunk whose accumulated total meets the target, or by
+        # _finish_stream if the utterance ends short.
+        self._prefill_target_bytes: int = (
+            cli_args.prefill_ms * SAMPLE_RATE * SAMPLE_WIDTH * CHANNELS // 1000
+        )
+        self._prefill_buffer: list[bytes] = []
+        self._prefill_bytes: int = 0
         # Wall clock for debug timing logs: monotonic time when this stream
         # received SynthesizeStart (or when a legacy Synthesize started).
         self._stream_started_at: float | None = None
@@ -66,6 +76,7 @@ class MicrosoftEventHandler(AsyncEventHandler):
                 if not self.cli_args.ssml_input:
                     synthesize.text = remove_asterisks(synthesize.text)
                 self._stream_audio_started = False
+                self._reset_prefill()
                 self._stream_started_at = time.monotonic()
                 _LOGGER.debug("[recv] Synthesize (legacy)")
                 await self._handle_synthesize(synthesize)
@@ -82,6 +93,7 @@ class MicrosoftEventHandler(AsyncEventHandler):
                 self.sbd = SentenceBoundaryDetector(ssml=self.cli_args.ssml_input)
                 self._synthesize = Synthesize(text="", voice=stream_start.voice)
                 self._stream_audio_started = False
+                self._reset_prefill()
                 self._stream_started_at = time.monotonic()
                 _LOGGER.debug(
                     "[recv] SynthesizeStart voice=%s", stream_start.voice
@@ -179,14 +191,36 @@ class MicrosoftEventHandler(AsyncEventHandler):
 
         async def emit_chunk(chunk_bytes: bytes) -> None:
             nonlocal first_chunk_logged
+            # While the stream hasn't started, hold chunks in the prefill
+            # buffer. Start the stream (AudioStart + drain) once the
+            # buffered total meets the prefill target, or immediately if
+            # prefill is disabled (target == 0).
             if not self._stream_audio_started:
-                await self.write_event(
-                    AudioStart(rate=rate, width=width, channels=channels).event(),
-                )
-                self._stream_audio_started = True
-                _LOGGER.debug(
-                    "[send] AudioStart t+%.3fs", self._since_stream_start()
-                )
+                self._prefill_buffer.append(chunk_bytes)
+                self._prefill_bytes += len(chunk_bytes)
+                if self._prefill_bytes < self._prefill_target_bytes:
+                    return
+                await self._start_stream_audio(rate, width, channels)
+                if not first_chunk_logged:
+                    _LOGGER.debug(
+                        "[send] first AudioChunk t+%.3fs (bytes=%d)",
+                        self._since_stream_start(),
+                        len(self._prefill_buffer[0]),
+                    )
+                    first_chunk_logged = True
+                for held in self._prefill_buffer:
+                    await self.write_event(
+                        AudioChunk(
+                            audio=held,
+                            rate=rate,
+                            width=width,
+                            channels=channels,
+                        ).event(),
+                    )
+                self._prefill_buffer.clear()
+                self._prefill_bytes = 0
+                return
+
             await self.write_event(
                 AudioChunk(
                     audio=chunk_bytes,
@@ -218,13 +252,59 @@ class MicrosoftEventHandler(AsyncEventHandler):
             raise
 
     async def _finish_stream(self) -> None:
-        """Emit AudioStop if any audio was sent for the current stream."""
+        """Emit AudioStop if any audio was sent for the current stream.
+
+        If the utterance ended before the prefill target was reached, drain
+        whatever's still buffered so the satellite hears the full audio
+        rather than losing the tail.
+        """
+        if self._prefill_buffer:
+            await self._start_stream_audio(SAMPLE_RATE, SAMPLE_WIDTH, CHANNELS)
+            for held in self._prefill_buffer:
+                await self.write_event(
+                    AudioChunk(
+                        audio=held,
+                        rate=SAMPLE_RATE,
+                        width=SAMPLE_WIDTH,
+                        channels=CHANNELS,
+                    ).event(),
+                )
+            _LOGGER.debug(
+                "[send] prefill flushed (short utterance, %d bytes) t+%.3fs",
+                self._prefill_bytes,
+                self._since_stream_start(),
+            )
+            self._prefill_buffer.clear()
+            self._prefill_bytes = 0
+
         if self._stream_audio_started:
             await self.write_event(AudioStop().event())
             _LOGGER.debug(
                 "[send] AudioStop t+%.3fs", self._since_stream_start()
             )
             self._stream_audio_started = False
+
+    async def _start_stream_audio(
+        self, rate: int, width: int, channels: int
+    ) -> None:
+        """Emit AudioStart once per stream and log the prefill that filled it."""
+        if self._stream_audio_started:
+            return
+        await self.write_event(
+            AudioStart(rate=rate, width=width, channels=channels).event(),
+        )
+        self._stream_audio_started = True
+        _LOGGER.debug(
+            "[send] AudioStart t+%.3fs (prefill=%d/%d bytes)",
+            self._since_stream_start(),
+            self._prefill_bytes,
+            self._prefill_target_bytes,
+        )
+
+    def _reset_prefill(self) -> None:
+        """Drop any prefill state so the next stream starts from a clean slate."""
+        self._prefill_buffer.clear()
+        self._prefill_bytes = 0
 
     def _since_stream_start(self) -> float:
         """Seconds since this stream began; used only for debug log relative times."""
