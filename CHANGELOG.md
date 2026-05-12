@@ -1,5 +1,18 @@
 # Changelog
 
+## [1.4.6](https://github.com/nuzayets/wyoming-microsoft-tts/compare/v1.4.5...v1.4.6) (2026-05-12)
+
+
+### 🐛 Bugfixes
+
+* prevent Voice PE self-feedback loop and lower TTS latency ([98753ba](https://github.com/nuzayets/wyoming-microsoft-tts/commit/98753baa12f53c5de202e85ed8ccb3ce140bb625))
+* re-anchor pace clock after gaps so SynthesizeStopped tracks playback end ([3f3af46](https://github.com/nuzayets/wyoming-microsoft-tts/commit/3f3af469cca43859a042371a92aed18abc12f5d1))
+
+
+### 🔧 Miscellaneous Chores
+
+* fix lint + CI workflows on the fork ([55848ce](https://github.com/nuzayets/wyoming-microsoft-tts/commit/55848cec087580cc43d1d5e0df264a42f4951233))
+
 ## [1.4.5](https://github.com/hugobloem/wyoming-microsoft-tts/compare/v1.4.4...v1.4.5) (2026-05-04)
 
 
