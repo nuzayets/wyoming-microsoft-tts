@@ -68,22 +68,6 @@ def parse_arguments():
         help="Disable audio streaming on sentence boundaries",
     )
     parser.add_argument("--samples-per-chunk", type=int, default=1024)
-    parser.add_argument(
-        "--streaming-pacing-buffer-seconds",
-        type=float,
-        default=0.5,
-        help="Target seconds of audio kept in-flight ahead of the client's "
-        "playback clock. Lower values pin stream end closer to playback end "
-        "(see esphome/home-assistant-voice-pe#537); higher values tolerate "
-        "more network jitter at the cost of late stream-end. Default: 0.5",
-    )
-    parser.add_argument(
-        "--no-streaming-pacing",
-        action="store_true",
-        help="Emit audio chunks as fast as the socket accepts them "
-        "(pre-pacing behavior). Will likely re-trigger the Voice PE "
-        "self-feedback loop on fast cloud TTS.",
-    )
     #
     parser.add_argument(
         "--rate",
