@@ -135,7 +135,16 @@ async def main() -> None:
     validate_args(args)
 
     # setup logging
-    logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO)
+    logging.basicConfig(
+        level=logging.DEBUG if args.debug else logging.INFO,
+        format="%(asctime)s.%(msecs)03d %(levelname)s %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    _LOGGER.info(
+        "wyoming-microsoft-tts %s (sha=%s)",
+        __version__,
+        os.environ.get("WYOMING_MS_TTS_GIT_SHA", "unknown"),
+    )
     _LOGGER.debug("Arguments parsed successfully.")
 
     # Load voice info

@@ -1,5 +1,8 @@
 FROM python:3.13-slim-bullseye
 
+ARG GIT_SHA=unknown
+ENV WYOMING_MS_TTS_GIT_SHA=$GIT_SHA
+
 # Install the Python package
 COPY . /app
 WORKDIR /app

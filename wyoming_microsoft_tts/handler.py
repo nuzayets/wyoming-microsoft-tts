@@ -47,6 +47,9 @@ class MicrosoftEventHandler(AsyncEventHandler):
         # is continuous instead of resetting per sentence.
         self._pace_start: float | None = None
         self._pace_bytes_sent: int = 0
+        # Wall clock for debug timing logs: monotonic time when this stream
+        # received SynthesizeStart (or when a legacy Synthesize started).
+        self._stream_started_at: float | None = None
 
     async def handle_event(self, event: Event) -> bool:  # noqa: C901
         """Handle an event."""
@@ -63,7 +66,10 @@ class MicrosoftEventHandler(AsyncEventHandler):
                 synthesize = Synthesize.from_event(event)
                 synthesize.text = remove_asterisks(synthesize.text)
                 self._reset_pacing()
+                self._stream_started_at = time.monotonic()
+                _LOGGER.debug("[recv] Synthesize (legacy)")
                 await self._handle_synthesize(synthesize, is_final=True)
+                self._stream_started_at = None
                 return True
 
             if self.cli_args.no_streaming:
@@ -75,7 +81,10 @@ class MicrosoftEventHandler(AsyncEventHandler):
                 self.sbd = SentenceBoundaryDetector()
                 self._synthesize = Synthesize(text="", voice=stream_start.voice)
                 self._reset_pacing()
-                _LOGGER.debug("Text stream started: voice=%s", stream_start.voice)
+                self._stream_started_at = time.monotonic()
+                _LOGGER.debug(
+                    "[recv] SynthesizeStart voice=%s", stream_start.voice
+                )
                 return True
 
             if SynthesizeChunk.is_type(event.type):
@@ -85,17 +94,35 @@ class MicrosoftEventHandler(AsyncEventHandler):
                     )
                     return True
                 stream_chunk = SynthesizeChunk.from_event(event)
+                _LOGGER.debug(
+                    "[recv] SynthesizeChunk len=%d t+%.3fs",
+                    len(stream_chunk.text),
+                    self._since_stream_start(),
+                )
                 for sentence in self.sbd.add_chunk(stream_chunk.text):
-                    _LOGGER.debug("Synthesizing stream sentence: %s", sentence)
+                    _LOGGER.debug(
+                        "[sbd] yielded sentence at t+%.3fs: %s",
+                        self._since_stream_start(),
+                        sentence,
+                    )
                     self._synthesize.text = sentence
                     await self._handle_synthesize(self._synthesize)
                 return True
 
             if SynthesizeStop.is_type(event.type):
+                _LOGGER.debug(
+                    "[recv] SynthesizeStop t+%.3fs",
+                    self._since_stream_start(),
+                )
                 drained = False
                 if self.is_streaming and self._synthesize is not None:
                     self._synthesize.text = self.sbd.finish()
                     if self._synthesize.text:
+                        _LOGGER.debug(
+                            "[sbd] flushing final at t+%.3fs: %s",
+                            self._since_stream_start(),
+                            self._synthesize.text,
+                        )
                         await self._handle_synthesize(
                             self._synthesize, is_final=True
                         )
@@ -106,11 +133,15 @@ class MicrosoftEventHandler(AsyncEventHandler):
                     # signalling end-of-stream.
                     await self._pace_drain()
                 await self.write_event(SynthesizeStopped().event())
+                _LOGGER.debug(
+                    "[send] SynthesizeStopped t+%.3fs",
+                    self._since_stream_start(),
+                )
                 self.is_streaming = False
                 self._synthesize = None
                 self.sbd = SentenceBoundaryDetector()
                 self._reset_pacing()
-                _LOGGER.debug("Text stream stopped")
+                self._stream_started_at = None
                 return True
 
             return True
@@ -151,13 +182,18 @@ class MicrosoftEventHandler(AsyncEventHandler):
         audio_started = False
         buf = b""
 
+        chunks_emitted = 0
+
         async def emit_chunk(chunk_bytes: bytes) -> None:
-            nonlocal audio_started
+            nonlocal audio_started, chunks_emitted
             if not audio_started:
                 await self.write_event(
                     AudioStart(rate=rate, width=width, channels=channels).event(),
                 )
                 audio_started = True
+                _LOGGER.debug(
+                    "[send] AudioStart t+%.3fs", self._since_stream_start()
+                )
             await self._pace_before_send(len(chunk_bytes))
             await self.write_event(
                 AudioChunk(
@@ -168,6 +204,13 @@ class MicrosoftEventHandler(AsyncEventHandler):
                 ).event(),
             )
             self._pace_bytes_sent += len(chunk_bytes)
+            chunks_emitted += 1
+            if chunks_emitted == 1:
+                _LOGGER.debug(
+                    "[send] first AudioChunk t+%.3fs (bytes=%d)",
+                    self._since_stream_start(),
+                    len(chunk_bytes),
+                )
 
         try:
             async for raw in self.microsoft_tts.synthesize_stream(
@@ -189,13 +232,24 @@ class MicrosoftEventHandler(AsyncEventHandler):
             if is_final:
                 await self._pace_drain()
             await self.write_event(AudioStop().event())
-        _LOGGER.debug("Completed request")
+            _LOGGER.debug(
+                "[send] AudioStop t+%.3fs (chunks=%d, is_final=%s)",
+                self._since_stream_start(),
+                chunks_emitted,
+                is_final,
+            )
         return True
 
     def _reset_pacing(self) -> None:
         """Reset the pacing clock at the start of a stream / legacy call."""
         self._pace_start = None
         self._pace_bytes_sent = 0
+
+    def _since_stream_start(self) -> float:
+        """Seconds since this stream began; used only for debug log relative times."""
+        if self._stream_started_at is None:
+            return 0.0
+        return time.monotonic() - self._stream_started_at
 
     async def _pace_drain(self) -> None:
         """Wait for the paced audio to finish playing on the client.
@@ -209,6 +263,12 @@ class MicrosoftEventHandler(AsyncEventHandler):
         self-feedback loop (esphome/home-assistant-voice-pe#537).
         """
         if self.cli_args.no_streaming_pacing or self._pace_start is None:
+            _LOGGER.debug(
+                "[drain] skipped t+%.3fs (no_pacing=%s, pace_start=%s)",
+                self._since_stream_start(),
+                self.cli_args.no_streaming_pacing,
+                self._pace_start,
+            )
             return
         bytes_per_second = SAMPLE_RATE * SAMPLE_WIDTH * CHANNELS
         audio_seconds_sent = self._pace_bytes_sent / bytes_per_second
@@ -218,6 +278,12 @@ class MicrosoftEventHandler(AsyncEventHandler):
             + self.cli_args.streaming_pacing_buffer_seconds
         )
         sleep_for = target_time - time.monotonic()
+        _LOGGER.debug(
+            "[drain] t+%.3fs audio_sent=%.3fs sleep=%.3fs",
+            self._since_stream_start(),
+            audio_seconds_sent,
+            max(0.0, sleep_for),
+        )
         if sleep_for > 0:
             await asyncio.sleep(sleep_for)
 
