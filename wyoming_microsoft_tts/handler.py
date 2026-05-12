@@ -1,10 +1,9 @@
 """Event handler for clients of the server."""
 
 import argparse
+import asyncio
 import logging
-import math
-import os
-import wave
+import time
 
 from wyoming.audio import AudioChunk, AudioStart, AudioStop
 from wyoming.error import Error
@@ -19,7 +18,7 @@ from wyoming.tts import (
     SynthesizeStopped,
 )
 
-from .microsoft_tts import MicrosoftTTS
+from .microsoft_tts import CHANNELS, SAMPLE_RATE, SAMPLE_WIDTH, MicrosoftTTS
 from .sentence_boundary import SentenceBoundaryDetector, remove_asterisks
 
 _LOGGER = logging.getLogger(__name__)
@@ -44,8 +43,12 @@ class MicrosoftEventHandler(AsyncEventHandler):
         self.sbd = SentenceBoundaryDetector()
         self.is_streaming: bool | None = None
         self._synthesize: Synthesize | None = None
+        # Pacing clock — shared across all sentences in a stream so playback
+        # is continuous instead of resetting per sentence.
+        self._pace_start: float | None = None
+        self._pace_bytes_sent: int = 0
 
-    async def handle_event(self, event: Event) -> bool:  # noqa: C901
+    async def handle_event(self, event: Event) -> bool:
         """Handle an event."""
         if Describe.is_type(event.type):
             await self.write_event(self.wyoming_info_event)
@@ -54,53 +57,54 @@ class MicrosoftEventHandler(AsyncEventHandler):
 
         try:
             if Synthesize.is_type(event.type):
+                # Legacy non-streaming TTS request.
                 if self.is_streaming:
                     return True
-
                 synthesize = Synthesize.from_event(event)
                 synthesize.text = remove_asterisks(synthesize.text)
+                self._reset_pacing()
                 await self._handle_synthesize(synthesize)
+                return True
 
             if self.cli_args.no_streaming:
                 return True
 
             if SynthesizeStart.is_type(event.type):
-                # Start of a stream
                 stream_start = SynthesizeStart.from_event(event)
                 self.is_streaming = True
                 self.sbd = SentenceBoundaryDetector()
                 self._synthesize = Synthesize(text="", voice=stream_start.voice)
+                self._reset_pacing()
                 _LOGGER.debug("Text stream started: voice=%s", stream_start.voice)
                 return True
 
             if SynthesizeChunk.is_type(event.type):
-                assert self._synthesize is not None
+                if not self.is_streaming or self._synthesize is None:
+                    _LOGGER.warning(
+                        "Got SynthesizeChunk outside an active stream"
+                    )
+                    return True
                 stream_chunk = SynthesizeChunk.from_event(event)
                 for sentence in self.sbd.add_chunk(stream_chunk.text):
                     _LOGGER.debug("Synthesizing stream sentence: %s", sentence)
                     self._synthesize.text = sentence
                     await self._handle_synthesize(self._synthesize)
-
                 return True
 
             if SynthesizeStop.is_type(event.type):
-                assert self._synthesize is not None
-                self._synthesize.text = self.sbd.finish()
-                if self._synthesize.text:
-                    # Final audio chunk(s)
-                    await self._handle_synthesize(self._synthesize)
-
-                # End of audio
+                if self.is_streaming and self._synthesize is not None:
+                    self._synthesize.text = self.sbd.finish()
+                    if self._synthesize.text:
+                        await self._handle_synthesize(self._synthesize)
                 await self.write_event(SynthesizeStopped().event())
-
+                self.is_streaming = False
+                self._synthesize = None
+                self.sbd = SentenceBoundaryDetector()
+                self._reset_pacing()
                 _LOGGER.debug("Text stream stopped")
                 return True
 
-            if not Synthesize.is_type(event.type):
-                return True
-
-            synthesize = Synthesize.from_event(event)
-            return await self._handle_synthesize(synthesize)
+            return True
         except Exception as err:
             await self.write_event(
                 Error(text=str(err), code=err.__class__.__name__).event()
@@ -131,53 +135,77 @@ class MicrosoftEventHandler(AsyncEventHandler):
                 text = text + self.cli_args.auto_punctuation[0]
 
         _LOGGER.debug("Synthesizing: %s", text)
-        try:
-            output_path = self.microsoft_tts.synthesize(text=text, voice=voice)
-        except Exception as e:
-            _LOGGER.error("Failed to synthesize text: %s", e)
-            return False
+        rate, width, channels = SAMPLE_RATE, SAMPLE_WIDTH, CHANNELS
+        bytes_per_chunk = width * channels * self.cli_args.samples_per_chunk
+        audio_started = False
+        buf = b""
 
-        _LOGGER.debug("Synthesized text")
-        try:
-            wav_file: wave.Wave_read = wave.open(output_path, "rb")
-            with wav_file:
-                rate = wav_file.getframerate()
-                width = wav_file.getsampwidth()
-                channels = wav_file.getnchannels()
-
+        async def emit_chunk(chunk_bytes: bytes) -> None:
+            nonlocal audio_started
+            if not audio_started:
                 await self.write_event(
-                    AudioStart(
-                        rate=rate,
-                        width=width,
-                        channels=channels,
-                    ).event(),
+                    AudioStart(rate=rate, width=width, channels=channels).event(),
                 )
+                audio_started = True
+            await self._pace_before_send(len(chunk_bytes))
+            await self.write_event(
+                AudioChunk(
+                    audio=chunk_bytes,
+                    rate=rate,
+                    width=width,
+                    channels=channels,
+                ).event(),
+            )
+            self._pace_bytes_sent += len(chunk_bytes)
 
-                # Audio
-                audio_bytes = wav_file.readframes(wav_file.getnframes())
-                bytes_per_sample = width * channels
-                bytes_per_chunk = bytes_per_sample * self.cli_args.samples_per_chunk
-                num_chunks = int(math.ceil(len(audio_bytes) / bytes_per_chunk))
-
-                # Split into chunks
-                for i in range(num_chunks):
-                    offset = i * bytes_per_chunk
-                    chunk = audio_bytes[offset : offset + bytes_per_chunk]
-                    await self.write_event(
-                        AudioChunk(
-                            audio=chunk,
-                            rate=rate,
-                            width=width,
-                            channels=channels,
-                        ).event(),
-                    )
+        try:
+            async for raw in self.microsoft_tts.synthesize_stream(
+                text=text, voice=voice
+            ):
+                buf += raw
+                while len(buf) >= bytes_per_chunk:
+                    chunk, buf = buf[:bytes_per_chunk], buf[bytes_per_chunk:]
+                    await emit_chunk(chunk)
+            if buf:
+                await emit_chunk(buf)
         except Exception as e:
-            _LOGGER.error("Failed to send audio: %s", e)
+            _LOGGER.error("Failed to synthesize/stream audio: %s", e)
+            if audio_started:
+                await self.write_event(AudioStop().event())
             return False
 
-        await self.write_event(AudioStop().event())
+        if audio_started:
+            await self.write_event(AudioStop().event())
         _LOGGER.debug("Completed request")
-
-        os.unlink(output_path)
-
         return True
+
+    def _reset_pacing(self) -> None:
+        """Reset the pacing clock at the start of a stream / legacy call."""
+        self._pace_start = None
+        self._pace_bytes_sent = 0
+
+    async def _pace_before_send(self, next_chunk_bytes: int) -> None:
+        """Hold a chunk back so the stream tracks real-time playback.
+
+        We let the first ``--streaming-pacing-buffer-seconds`` of audio flow
+        unthrottled to fill the client's playback buffer, then sleep before
+        each subsequent chunk so the stream's end time approximates the
+        speaker's playback end time. Fixes the Voice PE feedback loop where
+        the satellite enters listening mode while audio is still playing
+        (esphome/home-assistant-voice-pe#537).
+        """
+        if self.cli_args.no_streaming_pacing:
+            return
+        bytes_per_second = SAMPLE_RATE * SAMPLE_WIDTH * CHANNELS
+        now = time.monotonic()
+        if self._pace_start is None:
+            self._pace_start = now
+        audio_seconds_sent = self._pace_bytes_sent / bytes_per_second
+        target_time = (
+            self._pace_start
+            + audio_seconds_sent
+            - self.cli_args.streaming_pacing_buffer_seconds
+        )
+        sleep_for = target_time - now
+        if sleep_for > 0:
+            await asyncio.sleep(sleep_for)

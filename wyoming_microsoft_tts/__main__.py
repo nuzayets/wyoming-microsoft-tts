@@ -12,6 +12,7 @@ from wyoming.server import AsyncServer
 
 from wyoming_microsoft_tts.download import get_voices
 from wyoming_microsoft_tts.handler import MicrosoftEventHandler
+from wyoming_microsoft_tts.microsoft_tts import MicrosoftTTS
 from wyoming_microsoft_tts.version import __version__
 
 _LOGGER = logging.getLogger(__name__)
@@ -67,6 +68,22 @@ def parse_arguments():
         help="Disable audio streaming on sentence boundaries",
     )
     parser.add_argument("--samples-per-chunk", type=int, default=1024)
+    parser.add_argument(
+        "--streaming-pacing-buffer-seconds",
+        type=float,
+        default=0.5,
+        help="Target seconds of audio kept in-flight ahead of the client's "
+        "playback clock. Lower values pin stream end closer to playback end "
+        "(see esphome/home-assistant-voice-pe#537); higher values tolerate "
+        "more network jitter at the cost of late stream-end. Default: 0.5",
+    )
+    parser.add_argument(
+        "--no-streaming-pacing",
+        action="store_true",
+        help="Emit audio chunks as fast as the socket accepts them "
+        "(pre-pacing behavior). Will likely re-trigger the Voice PE "
+        "self-feedback loop on fast cloud TTS.",
+    )
     #
     parser.add_argument(
         "--rate",
@@ -194,6 +211,11 @@ async def main() -> None:
             )
         ],
     )
+
+    # Warm Azure SDK before accepting connections so the first user request
+    # doesn't pay TLS/auth setup latency (which can trip Voice PE's hardcoded
+    # 2s media-player-start timeout in esphome/home-assistant-voice-pe#514).
+    await MicrosoftTTS(args).warmup()
 
     # Start server
     server = AsyncServer.from_uri(args.uri)

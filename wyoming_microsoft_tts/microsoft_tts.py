@@ -1,15 +1,30 @@
 """Microsoft TTS."""
 
+import asyncio
+import html
 import logging
-import tempfile
-import time
-from pathlib import Path
+from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
 
 import azure.cognitiveservices.speech as speechsdk
 
 from .download import get_voices
 
 _LOGGER = logging.getLogger(__name__)
+
+# Raw PCM avoids a WAV header in the stream so we can hand bytes straight
+# to the Wyoming client with a fixed, known format.
+_OUTPUT_FORMAT = speechsdk.SpeechSynthesisOutputFormat.Raw24Khz16BitMonoPcm
+SAMPLE_RATE = 24000
+SAMPLE_WIDTH = 2
+CHANNELS = 1
+
+
+@dataclass
+class _CallState:
+    loop: asyncio.AbstractEventLoop
+    queue: asyncio.Queue
+    error: list[Exception] = field(default_factory=list)
 
 
 class MicrosoftTTS:
@@ -22,18 +37,54 @@ class MicrosoftTTS:
         self.speech_config = speechsdk.SpeechConfig(
             subscription=args.subscription_key, region=args.service_region
         )
-
-        output_dir = str(tempfile.TemporaryDirectory())
-        output_dir = Path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
-        self.output_dir = output_dir
-
+        self.speech_config.set_speech_synthesis_output_format(_OUTPUT_FORMAT)
         self.voices = get_voices(args.download_dir)
 
+        # One synthesizer per instance — its WebSocket is reused across
+        # calls, cutting per-sentence TTFB from ~600ms to ~90ms.
+        # synthesize_stream is single-call at a time per instance.
+        self._synthesizer = speechsdk.SpeechSynthesizer(
+            speech_config=self.speech_config, audio_config=None
+        )
+        self._call: _CallState | None = None
+        self._synthesizer.synthesizing.connect(self._on_synthesizing)
+        self._synthesizer.synthesis_completed.connect(self._on_completed)
+        self._synthesizer.synthesis_canceled.connect(self._on_canceled)
+
+    def _on_synthesizing(self, evt) -> None:
+        call = self._call
+        if call is None:
+            return
+        data = evt.result.audio_data
+        if data:
+            call.loop.call_soon_threadsafe(call.queue.put_nowait, data)
+
+    def _on_completed(self, evt) -> None:
+        call = self._call
+        if call is None:
+            return
+        call.loop.call_soon_threadsafe(call.queue.put_nowait, None)
+
+    def _on_canceled(self, evt) -> None:
+        call = self._call
+        if call is None:
+            return
+        details = evt.result.cancellation_details
+        if details.reason == speechsdk.CancellationReason.Error:
+            call.error.append(
+                RuntimeError(f"Azure TTS canceled: {details.error_details}")
+            )
+        call.loop.call_soon_threadsafe(call.queue.put_nowait, None)
+
     def _build_ssml(self, text, voice):
-        """Build SSML with prosody and style parameters."""
+        """Build SSML embedding the voice (and any prosody/style flags).
+
+        Voice must be set via SSML — mutating speech_config.speech_synthesis_voice_name
+        is a no-op once the synthesizer has been constructed.
+        """
         voice_key = self.voices[voice]["key"]
         voice_lang = self.voices[voice]["language"]["code"]
+        safe_text = html.escape(text, quote=False)
 
         ssml_parts = [
             '<?xml version="1.0" encoding="UTF-8"?>',
@@ -65,7 +116,7 @@ class MicrosoftTTS:
                 prosody_attrs.append(f'volume="{self.args.volume}"')
             ssml_parts.append(f'<prosody {" ".join(prosody_attrs)}>')
 
-        ssml_parts.append(text)
+        ssml_parts.append(safe_text)
 
         if has_prosody:
             ssml_parts.append('</prosody>')
@@ -78,38 +129,50 @@ class MicrosoftTTS:
 
         return ''.join(ssml_parts)
 
-    def synthesize(self, text, voice=None):
-        """Synthesize text to speech."""
-        _LOGGER.debug(f"Requested TTS for [{text}]")
+    async def synthesize_stream(
+        self, text: str, voice: str | None = None
+    ) -> AsyncIterator[bytes]:
+        """Yield raw PCM bytes as Azure produces them.
+
+        Format is fixed by _OUTPUT_FORMAT (24 kHz, 16-bit, mono).
+        """
+        _LOGGER.debug("Requested TTS for [%s]", text)
         if voice is None:
             voice = self.args.voice
 
-        # Convert the requested voice to the key microsoft use.
-        self.speech_config.speech_synthesis_voice_name = self.voices[voice]["key"]
+        loop = asyncio.get_running_loop()
+        self._call = _CallState(loop=loop, queue=asyncio.Queue())
 
-        file_name = self.output_dir / f"{time.monotonic_ns()}.wav"
-        audio_config = speechsdk.audio.AudioOutputConfig(filename=str(file_name))
+        # Always synthesize via SSML so the voice is set per-request — the
+        # cached synthesizer ignores mutations to speech_config.speech_synthesis_voice_name.
+        ssml = self._build_ssml(text, voice)
+        _LOGGER.debug("Using SSML: %s", ssml)
+        future = self._synthesizer.start_speaking_ssml_async(ssml)
 
-        speech_synthesizer = speechsdk.SpeechSynthesizer(
-            speech_config=self.speech_config, audio_config=audio_config
-        )
+        try:
+            while True:
+                chunk = await self._call.queue.get()
+                if chunk is None:
+                    break
+                yield chunk
+            if self._call.error:
+                raise self._call.error[0]
+        finally:
+            self._call = None
+            # Reap the SDK future so its result is consumed.
+            await loop.run_in_executor(None, future.get)
 
-        if any([self.args.rate, self.args.pitch, self.args.volume, self.args.style, self.args.style_degree]):
-            ssml = self._build_ssml(text, voice)
-            _LOGGER.debug(f"Using SSML: {ssml}")
-            speech_synthesis_result = speech_synthesizer.speak_ssml_async(ssml).get()
-        else:
-            speech_synthesis_result = speech_synthesizer.speak_text_async(text).get()
-
-        if (
-            speech_synthesis_result.reason
-            == speechsdk.ResultReason.SynthesizingAudioCompleted
-        ):
-            _LOGGER.debug(f"Speech synthesized for text [{text}]")
-            return str(file_name)
-
-        elif speech_synthesis_result.reason == speechsdk.ResultReason.Canceled:
-            cancellation_details = speech_synthesis_result.cancellation_details
-            _LOGGER.warning(f"Speech synthesis canceled: {cancellation_details.reason}")
-            if cancellation_details.reason == speechsdk.CancellationReason.Error:
-                _LOGGER.warning(f"Error details: {cancellation_details.error_details}")
+    async def warmup(self) -> None:
+        """Run a tiny synth so the first real request doesn't pay TLS/auth
+        setup latency. SDK-internal state (auth tokens, etc.) appears to be
+        cached globally, so warming one instance reduces TTFB on other
+        fresh instances as well.
+        """
+        try:
+            async for _ in self.synthesize_stream(
+                "Warmup.", voice=self.args.voice
+            ):
+                pass
+            _LOGGER.info("Azure TTS warmed up")
+        except Exception as e:
+            _LOGGER.warning("Azure TTS warmup failed: %s", e)

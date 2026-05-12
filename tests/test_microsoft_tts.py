@@ -10,20 +10,21 @@ def test_initialize(microsoft_tts, configuration):
     """Test initialization."""
     assert microsoft_tts.args.voice == configuration["voice"]
     assert microsoft_tts.speech_config is not None
-    assert microsoft_tts.output_dir is not None
 
 
 @pytest.mark.skipif(
     not os.environ.get("SPEECH_KEY") or not os.environ.get("SPEECH_REGION"),
     reason="SPEECH_KEY and SPEECH_REGION environment variables required",
 )
-def test_synthesize(microsoft_tts):
-    """Test synthesize."""
-    text = "Hello, world!"
-    voice = "en-US-JennyNeural"
-
-    result = microsoft_tts.synthesize(text, voice)
-    assert result.endswith(".wav")
+@pytest.mark.asyncio
+async def test_synthesize_stream(microsoft_tts):
+    """Test synthesize_stream produces raw PCM bytes."""
+    chunks = [c async for c in microsoft_tts.synthesize_stream(
+        "Hello, world!", "en-US-JennyNeural"
+    )]
+    assert chunks
+    assert all(isinstance(c, (bytes, bytearray)) for c in chunks)
+    assert sum(len(c) for c in chunks) > 0
 
 
 # SSML Building Tests
@@ -205,136 +206,29 @@ def test_build_ssml_voice_key_and_lang():
     assert '<voice name="en-GB-SoniaNeural">' in ssml
 
 
-# Integration Tests with Synthesize
+# Integration Tests with synthesize_stream
 
 
 @pytest.mark.skipif(
     not os.environ.get("SPEECH_KEY") or not os.environ.get("SPEECH_REGION"),
     reason="SPEECH_KEY and SPEECH_REGION environment variables required",
 )
-def test_synthesize_with_rate():
-    """Test synthesize with rate parameter."""
-    args = SimpleNamespace(
-        subscription_key=os.environ.get("SPEECH_KEY"),
-        service_region=os.environ.get("SPEECH_REGION"),
-        download_dir="/tmp/",
-        voice="en-US-JennyNeural",
-        rate="+30%",
-        pitch=None,
-        volume=None,
-        style=None,
-        style_degree=None,
-    )
-    tts = MicrosoftTTS(args)
-    result = tts.synthesize("Testing rate parameter", "en-US-JennyNeural")
-
-    assert result is not None
-    assert result.endswith(".wav")
-
-
-@pytest.mark.skipif(
-    not os.environ.get("SPEECH_KEY") or not os.environ.get("SPEECH_REGION"),
-    reason="SPEECH_KEY and SPEECH_REGION environment variables required",
+@pytest.mark.parametrize(
+    "extra_args",
+    [
+        {"rate": "+30%"},
+        {"pitch": "+5%"},
+        {"volume": "loud"},
+        {"style": "cheerful"},
+        {"rate": "fast", "pitch": "+10%", "volume": "loud",
+         "style": "excited", "style_degree": 1.2},
+        {},
+    ],
 )
-def test_synthesize_with_pitch():
-    """Test synthesize with pitch parameter."""
-    args = SimpleNamespace(
-        subscription_key=os.environ.get("SPEECH_KEY"),
-        service_region=os.environ.get("SPEECH_REGION"),
-        download_dir="/tmp/",
-        voice="en-US-JennyNeural",
-        rate=None,
-        pitch="+5%",
-        volume=None,
-        style=None,
-        style_degree=None,
-    )
-    tts = MicrosoftTTS(args)
-    result = tts.synthesize("Testing pitch parameter", "en-US-JennyNeural")
-
-    assert result is not None
-    assert result.endswith(".wav")
-
-
-@pytest.mark.skipif(
-    not os.environ.get("SPEECH_KEY") or not os.environ.get("SPEECH_REGION"),
-    reason="SPEECH_KEY and SPEECH_REGION environment variables required",
-)
-def test_synthesize_with_volume():
-    """Test synthesize with volume parameter."""
-    args = SimpleNamespace(
-        subscription_key=os.environ.get("SPEECH_KEY"),
-        service_region=os.environ.get("SPEECH_REGION"),
-        download_dir="/tmp/",
-        voice="en-US-JennyNeural",
-        rate=None,
-        pitch=None,
-        volume="loud",
-        style=None,
-        style_degree=None,
-    )
-    tts = MicrosoftTTS(args)
-    result = tts.synthesize("Testing volume parameter", "en-US-JennyNeural")
-
-    assert result is not None
-    assert result.endswith(".wav")
-
-
-@pytest.mark.skipif(
-    not os.environ.get("SPEECH_KEY") or not os.environ.get("SPEECH_REGION"),
-    reason="SPEECH_KEY and SPEECH_REGION environment variables required",
-)
-def test_synthesize_with_style():
-    """Test synthesize with style parameter."""
-    args = SimpleNamespace(
-        subscription_key=os.environ.get("SPEECH_KEY"),
-        service_region=os.environ.get("SPEECH_REGION"),
-        download_dir="/tmp/",
-        voice="en-US-JennyNeural",
-        rate=None,
-        pitch=None,
-        volume=None,
-        style="cheerful",
-        style_degree=None,
-    )
-    tts = MicrosoftTTS(args)
-    result = tts.synthesize("Testing style parameter", "en-US-JennyNeural")
-
-    assert result is not None
-    assert result.endswith(".wav")
-
-
-@pytest.mark.skipif(
-    not os.environ.get("SPEECH_KEY") or not os.environ.get("SPEECH_REGION"),
-    reason="SPEECH_KEY and SPEECH_REGION environment variables required",
-)
-def test_synthesize_with_combined_parameters():
-    """Test synthesize with multiple parameters combined."""
-    args = SimpleNamespace(
-        subscription_key=os.environ.get("SPEECH_KEY"),
-        service_region=os.environ.get("SPEECH_REGION"),
-        download_dir="/tmp/",
-        voice="en-US-JennyNeural",
-        rate="fast",
-        pitch="+10%",
-        volume="loud",
-        style="excited",
-        style_degree=1.2,
-    )
-    tts = MicrosoftTTS(args)
-    result = tts.synthesize("Testing all parameters together", "en-US-JennyNeural")
-
-    assert result is not None
-    assert result.endswith(".wav")
-
-
-@pytest.mark.skipif(
-    not os.environ.get("SPEECH_KEY") or not os.environ.get("SPEECH_REGION"),
-    reason="SPEECH_KEY and SPEECH_REGION environment variables required",
-)
-def test_synthesize_without_parameters_still_works():
-    """Test that synthesize still works without any new parameters."""
-    args = SimpleNamespace(
+@pytest.mark.asyncio
+async def test_synthesize_stream_with_params(extra_args):
+    """synthesize_stream produces bytes for various SSML param combinations."""
+    base = dict(
         subscription_key=os.environ.get("SPEECH_KEY"),
         service_region=os.environ.get("SPEECH_REGION"),
         download_dir="/tmp/",
@@ -345,8 +239,11 @@ def test_synthesize_without_parameters_still_works():
         style=None,
         style_degree=None,
     )
-    tts = MicrosoftTTS(args)
-    result = tts.synthesize("Testing without parameters", "en-US-JennyNeural")
-
-    assert result is not None
-    assert result.endswith(".wav")
+    base.update(extra_args)
+    tts = MicrosoftTTS(SimpleNamespace(**base))
+    total = 0
+    async for chunk in tts.synthesize_stream(
+        "Testing parameters", "en-US-JennyNeural"
+    ):
+        total += len(chunk)
+    assert total > 0
