@@ -198,9 +198,17 @@ class MicrosoftEventHandler(AsyncEventHandler):
             return
         bytes_per_second = SAMPLE_RATE * SAMPLE_WIDTH * CHANNELS
         now = time.monotonic()
-        if self._pace_start is None:
-            self._pace_start = now
         audio_seconds_sent = self._pace_bytes_sent / bytes_per_second
+        # Re-anchor when wall time has pulled ahead of audio time, e.g. a
+        # slow LLM stalled between sentence boundaries. Otherwise the
+        # accumulated "debt" would let the next sentence burst out unpaced
+        # and SynthesizeStopped would fire before the client finishes
+        # playing it — the exact failure mode pacing exists to prevent.
+        if (
+            self._pace_start is None
+            or now - self._pace_start > audio_seconds_sent
+        ):
+            self._pace_start = now - audio_seconds_sent
         target_time = (
             self._pace_start
             + audio_seconds_sent
