@@ -3,12 +3,20 @@
 import asyncio
 import html
 import logging
+import re
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 
 import azure.cognitiveservices.speech as speechsdk
 
 from .download import get_voices
+
+# Strip the model's outer SSML envelope so the operator's <voice> always wins.
+# Matches <?xml ...?>, <speak ...>/</speak>, <voice ...>/</voice>.
+_SSML_ENVELOPE_RE = re.compile(
+    r"<\?xml[^?]*\?>|</?speak\b[^>]*>|</?voice\b[^>]*>",
+    re.IGNORECASE,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -76,22 +84,34 @@ class MicrosoftTTS:
             )
         call.loop.call_soon_threadsafe(call.queue.put_nowait, None)
 
-    def _build_ssml(self, text, voice):
+    def _build_ssml(self, text, voice):  # noqa: C901
         """Build SSML embedding the voice (and any prosody/style flags).
 
         Voice must be set via SSML — mutating speech_config.speech_synthesis_voice_name
         is a no-op once the synthesizer has been constructed.
+
+        When ``self.args.ssml_input`` is set, ``text`` is treated as an SSML
+        fragment: it is not HTML-escaped, and any model-supplied
+        ``<speak>``/``<voice>`` envelope is stripped so the operator's voice
+        is always the one Azure synthesizes with.
         """
+        is_ssml = bool(getattr(self.args, "ssml_input", False))
         voice_key = self.voices[voice]["key"]
         voice_lang = self.voices[voice]["language"]["code"]
-        safe_text = html.escape(text, quote=False)
+        if is_ssml:
+            safe_text = _SSML_ENVELOPE_RE.sub("", text).strip()
+        else:
+            safe_text = html.escape(text, quote=False)
 
         ssml_parts = [
             '<?xml version="1.0" encoding="UTF-8"?>',
             '<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis"',
         ]
 
-        if self.args.style or self.args.style_degree:
+        # In SSML-input mode we always emit the mstts namespace because the
+        # model may include <mstts:express-as> tags even when no operator
+        # style is configured.
+        if is_ssml or self.args.style or self.args.style_degree:
             ssml_parts.append(' xmlns:mstts="https://www.w3.org/2001/mstts"')
 
         ssml_parts.append(f' xml:lang="{voice_lang}">')

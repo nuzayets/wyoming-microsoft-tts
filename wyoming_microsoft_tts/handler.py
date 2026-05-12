@@ -39,7 +39,7 @@ class MicrosoftEventHandler(AsyncEventHandler):
         self.cli_args = cli_args
         self.wyoming_info_event = wyoming_info.event()
         self.microsoft_tts = MicrosoftTTS(cli_args)
-        self.sbd = SentenceBoundaryDetector()
+        self.sbd = SentenceBoundaryDetector(ssml=cli_args.ssml_input)
         self.is_streaming: bool | None = None
         self._synthesize: Synthesize | None = None
         # AudioStart is emitted once per stream (on the first chunk) and
@@ -63,7 +63,8 @@ class MicrosoftEventHandler(AsyncEventHandler):
                 if self.is_streaming:
                     return True
                 synthesize = Synthesize.from_event(event)
-                synthesize.text = remove_asterisks(synthesize.text)
+                if not self.cli_args.ssml_input:
+                    synthesize.text = remove_asterisks(synthesize.text)
                 self._stream_audio_started = False
                 self._stream_started_at = time.monotonic()
                 _LOGGER.debug("[recv] Synthesize (legacy)")
@@ -78,7 +79,7 @@ class MicrosoftEventHandler(AsyncEventHandler):
             if SynthesizeStart.is_type(event.type):
                 stream_start = SynthesizeStart.from_event(event)
                 self.is_streaming = True
-                self.sbd = SentenceBoundaryDetector()
+                self.sbd = SentenceBoundaryDetector(ssml=self.cli_args.ssml_input)
                 self._synthesize = Synthesize(text="", voice=stream_start.voice)
                 self._stream_audio_started = False
                 self._stream_started_at = time.monotonic()
@@ -131,7 +132,7 @@ class MicrosoftEventHandler(AsyncEventHandler):
                 )
                 self.is_streaming = False
                 self._synthesize = None
-                self.sbd = SentenceBoundaryDetector()
+                self.sbd = SentenceBoundaryDetector(ssml=self.cli_args.ssml_input)
                 self._stream_started_at = None
                 return True
 
@@ -159,7 +160,11 @@ class MicrosoftEventHandler(AsyncEventHandler):
         else:
             voice = synthesize.voice.name
 
-        if self.cli_args.auto_punctuation and text:
+        if (
+            self.cli_args.auto_punctuation
+            and text
+            and not self.cli_args.ssml_input
+        ):
             has_punctuation = any(
                 text[-1] == p for p in self.cli_args.auto_punctuation
             )

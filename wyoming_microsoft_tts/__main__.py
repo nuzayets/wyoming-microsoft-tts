@@ -96,6 +96,15 @@ def parse_arguments():
     )
     #
     parser.add_argument(
+        "--ssml-input",
+        action="store_true",
+        help=(
+            "Treat incoming text as SSML fragments. The model's <speak>/<voice> "
+            "envelope (if present) is stripped and replaced with the operator-"
+            "controlled voice; sentence splitting becomes SSML-tag-aware."
+        ),
+    )
+    parser.add_argument(
         "--update-voices",
         action="store_true",
         help="Download latest voices.json during startup",

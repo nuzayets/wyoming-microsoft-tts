@@ -30,6 +30,24 @@ async def test_synthesize_stream(microsoft_tts):
 # SSML Building Tests
 
 
+def _ssml_args(**overrides):
+    """Build a SimpleNamespace matching what MicrosoftTTS reads from args."""
+    base = {
+        "subscription_key": os.environ.get("SPEECH_KEY"),
+        "service_region": os.environ.get("SPEECH_REGION"),
+        "download_dir": "/tmp/",
+        "voice": "en-US-JennyNeural",
+        "rate": None,
+        "pitch": None,
+        "volume": None,
+        "style": None,
+        "style_degree": None,
+        "ssml_input": False,
+    }
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
+
 def test_build_ssml_with_rate():
     """Test SSML generation with rate parameter."""
     args = SimpleNamespace(
@@ -204,6 +222,98 @@ def test_build_ssml_voice_key_and_lang():
     # Should contain the voice key from the voices.json
     assert 'xml:lang="en-GB"' in ssml
     assert '<voice name="en-GB-SoniaNeural">' in ssml
+
+
+# SSML-input mode (model emits SSML fragments)
+
+
+def test_build_ssml_input_fragment_not_escaped():
+    """Inner SSML tags are preserved (not html-escaped) in SSML-input mode."""
+    args = _ssml_args(ssml_input=True)
+    tts = MicrosoftTTS(args)
+    ssml = tts._build_ssml(
+        "<prosody rate='slow'>Hello.</prosody>", "en-US-JennyNeural"
+    )
+    assert "<prosody rate='slow'>Hello.</prosody>" in ssml
+    # Must NOT appear escaped:
+    assert "&lt;prosody" not in ssml
+
+
+def test_build_ssml_input_always_emits_mstts_namespace():
+    """The mstts namespace is always declared so <mstts:express-as> works."""
+    args = _ssml_args(ssml_input=True)
+    tts = MicrosoftTTS(args)
+    ssml = tts._build_ssml(
+        "<mstts:express-as style='cheerful'>Hi.</mstts:express-as>",
+        "en-US-JennyNeural",
+    )
+    assert 'xmlns:mstts="https://www.w3.org/2001/mstts"' in ssml
+    assert "<mstts:express-as style='cheerful'>Hi.</mstts:express-as>" in ssml
+
+
+def test_build_ssml_input_strips_model_speak_envelope():
+    """A full <speak> document from the model is reduced to its inner content."""
+    args = _ssml_args(ssml_input=True)
+    tts = MicrosoftTTS(args)
+    fragment = (
+        '<?xml version="1.0"?>'
+        '<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" '
+        'xml:lang="en-US">'
+        '<voice name="en-US-AriaNeural">'
+        '<prosody rate="slow">Hello.</prosody>'
+        '</voice></speak>'
+    )
+    ssml = tts._build_ssml(fragment, "en-US-JennyNeural")
+    # Operator's voice wins:
+    assert '<voice name="en-US-JennyNeural">' in ssml
+    assert "AriaNeural" not in ssml
+    # Inner content survives:
+    assert '<prosody rate="slow">Hello.</prosody>' in ssml
+    # No double envelopes:
+    assert ssml.count("<speak") == 1
+    assert ssml.count("</speak>") == 1
+    assert ssml.count("<voice") == 1
+    assert ssml.count("</voice>") == 1
+
+
+def test_build_ssml_input_pins_operator_voice_and_lang():
+    """Operator voice and xml:lang come from CLI args, not the model."""
+    args = _ssml_args(ssml_input=True, voice="en-GB-SoniaNeural")
+    tts = MicrosoftTTS(args)
+    ssml = tts._build_ssml(
+        '<voice name="en-US-AriaNeural">Hi.</voice>', "en-GB-SoniaNeural"
+    )
+    assert '<voice name="en-GB-SoniaNeural">' in ssml
+    assert 'xml:lang="en-GB"' in ssml
+    assert "AriaNeural" not in ssml
+
+
+def test_build_ssml_input_preserves_operator_prosody_wrapper():
+    """Operator's --rate still wraps the model's content."""
+    args = _ssml_args(ssml_input=True, rate="+30%")
+    tts = MicrosoftTTS(args)
+    ssml = tts._build_ssml(
+        "<emphasis>Hi.</emphasis>", "en-US-JennyNeural"
+    )
+    assert '<prosody rate="+30%">' in ssml
+    assert "<emphasis>Hi.</emphasis>" in ssml
+    # Operator's prosody must wrap (open before, close after) the inner content.
+    prosody_open = ssml.index('<prosody rate="+30%">')
+    inner = ssml.index("<emphasis>")
+    prosody_close = ssml.index("</prosody>")
+    assert prosody_open < inner < prosody_close
+
+
+def test_build_ssml_input_off_escapes_angle_brackets():
+    """With ssml_input disabled, raw < and > must still be escaped (regression)."""
+    args = _ssml_args(ssml_input=False)
+    tts = MicrosoftTTS(args)
+    ssml = tts._build_ssml(
+        "<prosody>Hello.</prosody>", "en-US-JennyNeural"
+    )
+    # Treated as literal text → escaped:
+    assert "&lt;prosody&gt;" in ssml
+    assert "<prosody>Hello.</prosody>" not in ssml
 
 
 # Integration Tests with synthesize_stream
