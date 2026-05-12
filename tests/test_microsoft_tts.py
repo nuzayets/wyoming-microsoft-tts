@@ -228,17 +228,17 @@ def test_build_ssml_voice_key_and_lang():
 @pytest.mark.asyncio
 async def test_synthesize_stream_with_params(extra_args):
     """synthesize_stream produces bytes for various SSML param combinations."""
-    base = dict(
-        subscription_key=os.environ.get("SPEECH_KEY"),
-        service_region=os.environ.get("SPEECH_REGION"),
-        download_dir="/tmp/",
-        voice="en-US-JennyNeural",
-        rate=None,
-        pitch=None,
-        volume=None,
-        style=None,
-        style_degree=None,
-    )
+    base = {
+        "subscription_key": os.environ.get("SPEECH_KEY"),
+        "service_region": os.environ.get("SPEECH_REGION"),
+        "download_dir": "/tmp/",
+        "voice": "en-US-JennyNeural",
+        "rate": None,
+        "pitch": None,
+        "volume": None,
+        "style": None,
+        "style_degree": None,
+    }
     base.update(extra_args)
     tts = MicrosoftTTS(SimpleNamespace(**base))
     total = 0

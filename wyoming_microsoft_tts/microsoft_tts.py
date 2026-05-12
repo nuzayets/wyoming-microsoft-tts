@@ -163,10 +163,10 @@ class MicrosoftTTS:
             await loop.run_in_executor(None, future.get)
 
     async def warmup(self) -> None:
-        """Run a tiny synth so the first real request doesn't pay TLS/auth
-        setup latency. SDK-internal state (auth tokens, etc.) appears to be
-        cached globally, so warming one instance reduces TTFB on other
-        fresh instances as well.
+        """Run a tiny synth so the first real request doesn't pay TLS/auth setup latency.
+
+        SDK-internal state (auth tokens, etc.) appears to be cached globally,
+        so warming one instance reduces TTFB on other fresh instances as well.
         """
         try:
             async for _ in self.synthesize_stream(

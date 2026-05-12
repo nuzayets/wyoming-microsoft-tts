@@ -48,7 +48,7 @@ class MicrosoftEventHandler(AsyncEventHandler):
         self._pace_start: float | None = None
         self._pace_bytes_sent: int = 0
 
-    async def handle_event(self, event: Event) -> bool:
+    async def handle_event(self, event: Event) -> bool:  # noqa: C901
         """Handle an event."""
         if Describe.is_type(event.type):
             await self.write_event(self.wyoming_info_event)
@@ -111,7 +111,7 @@ class MicrosoftEventHandler(AsyncEventHandler):
             )
             raise err
 
-    async def _handle_synthesize(self, synthesize: Synthesize):
+    async def _handle_synthesize(self, synthesize: Synthesize):  # noqa: C901
         _LOGGER.debug(synthesize)
         raw_text = synthesize.text
 
