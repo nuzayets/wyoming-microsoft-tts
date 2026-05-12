@@ -63,7 +63,7 @@ class MicrosoftEventHandler(AsyncEventHandler):
                 synthesize = Synthesize.from_event(event)
                 synthesize.text = remove_asterisks(synthesize.text)
                 self._reset_pacing()
-                await self._handle_synthesize(synthesize)
+                await self._handle_synthesize(synthesize, is_final=True)
                 return True
 
             if self.cli_args.no_streaming:
@@ -92,10 +92,19 @@ class MicrosoftEventHandler(AsyncEventHandler):
                 return True
 
             if SynthesizeStop.is_type(event.type):
+                drained = False
                 if self.is_streaming and self._synthesize is not None:
                     self._synthesize.text = self.sbd.finish()
                     if self._synthesize.text:
-                        await self._handle_synthesize(self._synthesize)
+                        await self._handle_synthesize(
+                            self._synthesize, is_final=True
+                        )
+                        drained = True
+                if self.is_streaming and not drained:
+                    # No trailing sentence to synthesize, but earlier sentences
+                    # left a pacing buffer in the client. Wait it out before
+                    # signalling end-of-stream.
+                    await self._pace_drain()
                 await self.write_event(SynthesizeStopped().event())
                 self.is_streaming = False
                 self._synthesize = None
@@ -111,7 +120,9 @@ class MicrosoftEventHandler(AsyncEventHandler):
             )
             raise err
 
-    async def _handle_synthesize(self, synthesize: Synthesize):  # noqa: C901
+    async def _handle_synthesize(  # noqa: C901
+        self, synthesize: Synthesize, *, is_final: bool = False
+    ):
         _LOGGER.debug(synthesize)
         raw_text = synthesize.text
 
@@ -175,6 +186,8 @@ class MicrosoftEventHandler(AsyncEventHandler):
             return False
 
         if audio_started:
+            if is_final:
+                await self._pace_drain()
             await self.write_event(AudioStop().event())
         _LOGGER.debug("Completed request")
         return True
@@ -183,6 +196,30 @@ class MicrosoftEventHandler(AsyncEventHandler):
         """Reset the pacing clock at the start of a stream / legacy call."""
         self._pace_start = None
         self._pace_bytes_sent = 0
+
+    async def _pace_drain(self) -> None:
+        """Wait for the paced audio to finish playing on the client.
+
+        Pacing keeps the stream ``streaming_pacing_buffer_seconds`` ahead of
+        real-time so the client doesn't underrun. At end of stream we sleep
+        until that lead would have drained plus another buffer's worth, so
+        ``AudioStop`` / ``SynthesizeStopped`` land *after* the satellite's
+        speaker is actually empty. Without this the satellite transitions
+        back to listening with audio still playing — the original Voice PE
+        self-feedback loop (esphome/home-assistant-voice-pe#537).
+        """
+        if self.cli_args.no_streaming_pacing or self._pace_start is None:
+            return
+        bytes_per_second = SAMPLE_RATE * SAMPLE_WIDTH * CHANNELS
+        audio_seconds_sent = self._pace_bytes_sent / bytes_per_second
+        target_time = (
+            self._pace_start
+            + audio_seconds_sent
+            + self.cli_args.streaming_pacing_buffer_seconds
+        )
+        sleep_for = target_time - time.monotonic()
+        if sleep_for > 0:
+            await asyncio.sleep(sleep_for)
 
     async def _pace_before_send(self, next_chunk_bytes: int) -> None:
         """Hold a chunk back so the stream tracks real-time playback.
