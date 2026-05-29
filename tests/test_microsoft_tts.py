@@ -234,7 +234,8 @@ def test_build_ssml_input_fragment_not_escaped():
     ssml = tts._build_ssml(
         "<prosody rate='slow'>Hello.</prosody>", "en-US-JennyNeural"
     )
-    assert "<prosody rate='slow'>Hello.</prosody>" in ssml
+    # Sanitizer normalizes attribute quoting to double quotes.
+    assert '<prosody rate="slow">Hello.</prosody>' in ssml
     # Must NOT appear escaped:
     assert "&lt;prosody" not in ssml
 
@@ -248,7 +249,7 @@ def test_build_ssml_input_always_emits_mstts_namespace():
         "en-US-JennyNeural",
     )
     assert 'xmlns:mstts="https://www.w3.org/2001/mstts"' in ssml
-    assert "<mstts:express-as style='cheerful'>Hi.</mstts:express-as>" in ssml
+    assert '<mstts:express-as style="cheerful">Hi.</mstts:express-as>' in ssml
 
 
 def test_build_ssml_input_strips_model_speak_envelope():
@@ -302,6 +303,44 @@ def test_build_ssml_input_preserves_operator_prosody_wrapper():
     inner = ssml.index("<emphasis>")
     prosody_close = ssml.index("</prosody>")
     assert prosody_open < inner < prosody_close
+
+
+def test_build_ssml_input_sanitizes_invalid_prosody_rate():
+    """Regression: the exact malformed example from the bug report should synthesize.
+
+    Input has prosody rate="moderate" (invalid Azure enum) wrapped in the
+    model's own <speak>/<voice> envelope. After sanitization, rate is
+    coerced to "medium" and the model envelope is replaced by the
+    operator's.
+    """
+    args = _ssml_args(ssml_input=True, voice="en-GB-SoniaNeural")
+    tts = MicrosoftTTS(args)
+    ssml = tts._build_ssml(
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" '
+        'xmlns:mstts="https://www.w3.org/2001/mstts" xml:lang="en-GB">'
+        '<voice name="en-US-FableTurboMultilingualNeural">'
+        '<prosody rate="moderate">It is a lovely, sunny day in Toronto.</prosody>'
+        "</voice></speak>",
+        "en-GB-SoniaNeural",
+    )
+    assert '<prosody rate="medium">It is a lovely, sunny day in Toronto.</prosody>' in ssml
+    assert '<voice name="en-GB-SoniaNeural">' in ssml
+    assert "FableTurboMultilingualNeural" not in ssml
+    assert ssml.count("<speak") == 1
+    assert ssml.count("<voice") == 1
+
+
+def test_build_ssml_input_drops_unknown_voice_tag_keeps_text():
+    """A bare <voice> wrapper with no other markup leaves just the text."""
+    args = _ssml_args(ssml_input=True)
+    tts = MicrosoftTTS(args)
+    ssml = tts._build_ssml(
+        '<voice name="en-US-AriaNeural">Plain sentence.</voice>',
+        "en-US-JennyNeural",
+    )
+    assert "AriaNeural" not in ssml
+    assert "Plain sentence." in ssml
 
 
 def test_build_ssml_input_off_escapes_angle_brackets():

@@ -3,20 +3,13 @@
 import asyncio
 import html
 import logging
-import re
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 
 import azure.cognitiveservices.speech as speechsdk
 
 from .download import get_voices
-
-# Strip the model's outer SSML envelope so the operator's <voice> always wins.
-# Matches <?xml ...?>, <speak ...>/</speak>, <voice ...>/</voice>.
-_SSML_ENVELOPE_RE = re.compile(
-    r"<\?xml[^?]*\?>|</?speak\b[^>]*>|</?voice\b[^>]*>",
-    re.IGNORECASE,
-)
+from .ssml_sanitizer import sanitize_ssml_fragment
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -99,7 +92,7 @@ class MicrosoftTTS:
         voice_key = self.voices[voice]["key"]
         voice_lang = self.voices[voice]["language"]["code"]
         if is_ssml:
-            safe_text = _SSML_ENVELOPE_RE.sub("", text).strip()
+            safe_text = sanitize_ssml_fragment(text)
         else:
             safe_text = html.escape(text, quote=False)
 
