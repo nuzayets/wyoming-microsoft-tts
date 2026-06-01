@@ -59,6 +59,11 @@ class MicrosoftEventHandler(AsyncEventHandler):
         # Wall clock for debug timing logs: monotonic time when this stream
         # received SynthesizeStart (or when a legacy Synthesize started).
         self._stream_started_at: float | None = None
+        # Per-stream emission accounting — counts every AudioChunk we send
+        # so we can prove the full byte total left the server.
+        self._stream_chunks_emitted: int = 0
+        self._stream_bytes_emitted: int = 0
+        self._last_emit_at: float | None = None
 
     async def handle_event(self, event: Event) -> bool:  # noqa: C901
         """Handle an event."""
@@ -77,6 +82,7 @@ class MicrosoftEventHandler(AsyncEventHandler):
                     synthesize.text = remove_asterisks(synthesize.text)
                 self._stream_audio_started = False
                 self._reset_prefill()
+                self._reset_emit_stats()
                 self._stream_started_at = time.monotonic()
                 _LOGGER.debug("[recv] Synthesize (legacy)")
                 await self._handle_synthesize(synthesize)
@@ -94,6 +100,7 @@ class MicrosoftEventHandler(AsyncEventHandler):
                 self._synthesize = Synthesize(text="", voice=stream_start.voice)
                 self._stream_audio_started = False
                 self._reset_prefill()
+                self._reset_emit_stats()
                 self._stream_started_at = time.monotonic()
                 _LOGGER.debug(
                     "[recv] SynthesizeStart voice=%s", stream_start.voice
@@ -209,26 +216,12 @@ class MicrosoftEventHandler(AsyncEventHandler):
                     )
                     first_chunk_logged = True
                 for held in self._prefill_buffer:
-                    await self.write_event(
-                        AudioChunk(
-                            audio=held,
-                            rate=rate,
-                            width=width,
-                            channels=channels,
-                        ).event(),
-                    )
+                    await self._write_audio_chunk(held, rate, width, channels)
                 self._prefill_buffer.clear()
                 self._prefill_bytes = 0
                 return
 
-            await self.write_event(
-                AudioChunk(
-                    audio=chunk_bytes,
-                    rate=rate,
-                    width=width,
-                    channels=channels,
-                ).event(),
-            )
+            await self._write_audio_chunk(chunk_bytes, rate, width, channels)
             if not first_chunk_logged:
                 _LOGGER.debug(
                     "[send] first AudioChunk t+%.3fs (bytes=%d)",
@@ -261,13 +254,8 @@ class MicrosoftEventHandler(AsyncEventHandler):
         if self._prefill_buffer:
             await self._start_stream_audio(SAMPLE_RATE, SAMPLE_WIDTH, CHANNELS)
             for held in self._prefill_buffer:
-                await self.write_event(
-                    AudioChunk(
-                        audio=held,
-                        rate=SAMPLE_RATE,
-                        width=SAMPLE_WIDTH,
-                        channels=CHANNELS,
-                    ).event(),
+                await self._write_audio_chunk(
+                    held, SAMPLE_RATE, SAMPLE_WIDTH, CHANNELS
                 )
             _LOGGER.debug(
                 "[send] prefill flushed (short utterance, %d bytes) t+%.3fs",
@@ -279,6 +267,14 @@ class MicrosoftEventHandler(AsyncEventHandler):
 
         if self._stream_audio_started:
             await self.write_event(AudioStop().event())
+            _LOGGER.info(
+                "[stream-end] chunks=%d bytes=%d (%.2fs audio) t+%.3fs",
+                self._stream_chunks_emitted,
+                self._stream_bytes_emitted,
+                self._stream_bytes_emitted
+                / (SAMPLE_RATE * SAMPLE_WIDTH * CHANNELS),
+                self._since_stream_start(),
+            )
             _LOGGER.debug(
                 "[send] AudioStop t+%.3fs", self._since_stream_start()
             )
@@ -305,6 +301,46 @@ class MicrosoftEventHandler(AsyncEventHandler):
         """Drop any prefill state so the next stream starts from a clean slate."""
         self._prefill_buffer.clear()
         self._prefill_bytes = 0
+
+    def _reset_emit_stats(self) -> None:
+        """Reset per-stream emission counters."""
+        self._stream_chunks_emitted = 0
+        self._stream_bytes_emitted = 0
+        self._last_emit_at = None
+
+    async def _write_audio_chunk(
+        self, audio: bytes, rate: int, width: int, channels: int
+    ) -> None:
+        """Send one AudioChunk and update per-stream accounting.
+
+        Logs the chunk index, size, cumulative bytes, and time since the
+        previous emit so we can spot gaps between consecutive chunks
+        leaving the server.
+        """
+        before = time.monotonic()
+        gap_ms = (
+            int((before - self._last_emit_at) * 1000)
+            if self._last_emit_at is not None
+            else 0
+        )
+        await self.write_event(
+            AudioChunk(
+                audio=audio, rate=rate, width=width, channels=channels
+            ).event(),
+        )
+        after = time.monotonic()
+        self._stream_chunks_emitted += 1
+        self._stream_bytes_emitted += len(audio)
+        self._last_emit_at = after
+        _LOGGER.debug(
+            "[send] chunk #%d size=%d total=%d t+%.3fs gap=%dms write=%dms",
+            self._stream_chunks_emitted,
+            len(audio),
+            self._stream_bytes_emitted,
+            self._since_stream_start(),
+            gap_ms,
+            int((after - before) * 1000),
+        )
 
     def _since_stream_start(self) -> float:
         """Seconds since this stream began; used only for debug log relative times."""

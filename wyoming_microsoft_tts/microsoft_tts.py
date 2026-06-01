@@ -3,6 +3,7 @@
 import asyncio
 import html
 import logging
+import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 
@@ -160,14 +161,36 @@ class MicrosoftTTS:
         # cached synthesizer ignores mutations to speech_config.speech_synthesis_voice_name.
         ssml = self._build_ssml(text, voice)
         _LOGGER.debug("Using SSML: %s", ssml)
+        t_start = time.monotonic()
         future = self._synthesizer.start_speaking_ssml_async(ssml)
 
+        delta_idx = 0
+        cumulative = 0
+        t_last = t_start
         try:
             while True:
                 chunk = await self._call.queue.get()
                 if chunk is None:
                     break
+                now = time.monotonic()
+                delta_idx += 1
+                cumulative += len(chunk)
+                _LOGGER.debug(
+                    "[azure] delta #%d size=%d total=%d t+%.3fs gap=%dms",
+                    delta_idx,
+                    len(chunk),
+                    cumulative,
+                    now - t_start,
+                    int((now - t_last) * 1000),
+                )
+                t_last = now
                 yield chunk
+            _LOGGER.debug(
+                "[azure] completed: %d deltas, %d bytes total, t+%.3fs",
+                delta_idx,
+                cumulative,
+                time.monotonic() - t_start,
+            )
             if self._call.error:
                 raise self._call.error[0]
         finally:
